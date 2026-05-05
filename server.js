@@ -3,7 +3,7 @@ const express = require("express");
 const cors = require("cors");
 const Stripe = require("stripe");
 const cron = require("node-cron");
-const admin = require("firebase-admin");
+
 
 const app = express();
 
@@ -20,13 +20,7 @@ if (!stripeKey) {
 const stripe = Stripe(stripeKey);
 
 // Firebase init
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.applicationDefault(),
-  });
-}
 
-const db = admin.firestore();
 
 app.get("/", (req, res) => {
   res.send("BookLocal Stripe backend is running");
