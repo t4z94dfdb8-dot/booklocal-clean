@@ -2,78 +2,16 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
-const Stripe = require("stripe");
-const cron = require("node-cron");
 const admin = require("firebase-admin");
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
-const stripeKey = process.env.STRIPE_SECRET_KEY;
-
-if (!stripeKey) {
-  console.error("❌ STRIPE_SECRET_KEY is missing");
-  process.exit(1);
-}
-
 if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
   console.error("❌ FIREBASE_SERVICE_ACCOUNT_JSON is missing");
   process.exit(1);
 }
-
-/**
- * Payments here are destination charges: the PaymentIntent is created on the
- * platform account with `transfer_data.destination`, so `payment_intent.*`
- * events arrive on the **platform** ("Your account") — while `account.updated`,
- * which drives `payoutsEnabled`, arrives on **Connected accounts**.
- *
- * Stripe scopes an endpoint to one or the other, so that is two endpoints
- * pointing at this same URL, each with its own signing secret. Hence a list:
- *
- *   STRIPE_WEBHOOK_SECRET=whsec_platform...,whsec_connect...
- */
-const webhookSecrets = (process.env.STRIPE_WEBHOOK_SECRET || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-if (!webhookSecrets.length) {
-  console.warn(
-    "⚠️  STRIPE_WEBHOOK_SECRET is missing — /stripe-webhook will reject every request"
-  );
-} else {
-  // Count only, never the values. Two are expected: one for the platform
-  // ("Your account") endpoint and one for the Connect endpoint.
-  console.log(`🔑 ${webhookSecrets.length} webhook signing secret(s) loaded`);
-
-  if (webhookSecrets.length === 1) {
-    console.warn(
-      "⚠️  Only one secret configured. account.updated arrives on a separate " +
-        "Connect endpoint, so payoutsEnabled will never be set without its secret too."
-    );
-  }
-}
-
-/**
- * Verifies against each configured secret and returns the event, so one URL can
- * serve both endpoints. Stripe's own comparison is timing-safe.
- */
-function constructWebhookEvent(rawBody, signature) {
-  let lastError;
-
-  for (const secret of webhookSecrets) {
-    try {
-      return stripe.webhooks.constructEvent(rawBody, signature, secret);
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  throw lastError || new Error("No webhook signing secret configured");
-}
-
-const stripe = Stripe(stripeKey);
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -85,40 +23,11 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 
-// Platform commission taken from every booking.
-const PLATFORM_FEE_RATE = 0.2;
-
-// How long the tourist has to confirm or dispute after the guide marks a trip
-// finished, before the money is released automatically.
-const AUTO_RELEASE_HOURS = 24;
-
-// A payment intent that never got paid is abandoned after this long.
-const PENDING_PAYMENT_TTL_MINUTES = 30;
-
 const MAX_HOURS = 12;
 const MAX_PEOPLE = 20;
 
 // How long a user is muted after three contact-sharing warnings.
 const MUTE_MINUTES = 30;
-
-/**
- * Public origin of this server, used for the Stripe Connect return pages.
- * Railway injects RAILWAY_PUBLIC_DOMAIN; PUBLIC_BASE_URL overrides it if the
- * service ever moves behind a custom domain.
- */
-const publicBaseUrl = (
-  process.env.PUBLIC_BASE_URL ||
-  (process.env.RAILWAY_PUBLIC_DOMAIN
-    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
-    : "")
-).replace(/\/$/, "");
-
-if (!publicBaseUrl) {
-  console.warn(
-    "⚠️  Neither PUBLIC_BASE_URL nor RAILWAY_PUBLIC_DOMAIN is set — Stripe " +
-      "Connect onboarding will have nowhere to return to."
-  );
-}
 
 const NAME_PLACEHOLDER = "Traveller";
 
@@ -139,18 +48,13 @@ function displayName(value, fallback = NAME_PLACEHOLDER) {
   return trimmed;
 }
 
-// Statuses that mean "this booking is live, don't let the tourist book the
-// same guide again".
-const ACTIVE_BOOKING_STATUSES = [
-  "confirmed",
-  "waiting_tourist_confirmation",
-  "dispute",
-];
+// No money moves through the platform. A booking is a request the guide
+// accepts or declines; the traveller pays the guide directly on the day.
+const ACTIVE_BOOKING_STATUSES = ["pending", "confirmed"];
 
-// Statuses that occupy a slot in the guide's calendar. `pending_payment` is
-// included so a slot is held while the tourist is on the payment sheet — two
-// people paying at once would otherwise both succeed.
-const HELD_BOOKING_STATUSES = [...ACTIVE_BOOKING_STATUSES, "pending_payment"];
+// Statuses that occupy a slot in the guide's calendar. A pending request holds
+// the slot so two travellers cannot be promised the same hours.
+const HELD_BOOKING_STATUSES = ACTIVE_BOOKING_STATUSES;
 
 const app = express();
 
@@ -170,43 +74,6 @@ app.use(
       return callback(new Error("Origin not allowed"));
     },
   })
-);
-
-// ---------------------------------------------------------------------------
-// Stripe webhook — must be registered before express.json() so the raw body
-// stays intact for signature verification.
-// ---------------------------------------------------------------------------
-
-app.post(
-  "/stripe-webhook",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
-    if (!webhookSecrets.length) {
-      return res.status(500).send("Webhook secret not configured");
-    }
-
-    let event;
-
-    try {
-      event = constructWebhookEvent(
-        req.body,
-        req.headers["stripe-signature"]
-      );
-    } catch (error) {
-      console.error("❌ Webhook signature verification failed:", error.message);
-      return res.status(400).send(`Webhook Error: ${error.message}`);
-    }
-
-    try {
-      await handleStripeEvent(event);
-    } catch (error) {
-      // Return 500 so Stripe retries rather than dropping the event.
-      console.error("❌ Webhook handler error:", error.message);
-      return res.status(500).json({ error: error.message });
-    }
-
-    res.json({ received: true });
-  }
 );
 
 app.use(express.json());
@@ -262,8 +129,8 @@ async function sendPushNotification({ token, title, body, data = {} }) {
 }
 
 /**
- * Contact details (email, phone, fcmToken, stripeAccountId) live in a private
- * subdocument so browsing profiles never exposes them — see firestore.rules.
+ * Contact details (email, phone, fcmToken) live in a private subdocument so
+ * browsing profiles never exposes them — see firestore.rules.
  */
 function privateRef(collection, uid) {
   return db.collection(collection).doc(uid).collection("private").doc("secure");
@@ -299,38 +166,6 @@ function calculateAmountUsd(guideData, { serviceId, hours }) {
   const hourly = Number(guideData.priceFrom) > 0 ? Number(guideData.priceFrom) : 50;
 
   return hourly * hours;
-}
-
-/**
- * Releases any half-finished payment attempt for this tourist/guide pair so a
- * retry does not leave dangling authorizations behind.
- */
-async function clearStalePendingBookings(touristId, guideId) {
-  const snapshot = await db
-    .collection("bookings")
-    .where("touristId", "==", touristId)
-    .where("guideId", "==", guideId)
-    .where("status", "==", "pending_payment")
-    .get();
-
-  for (const doc of snapshot.docs) {
-    const data = doc.data();
-
-    if (data.paymentIntentId) {
-      try {
-        await stripe.paymentIntents.cancel(data.paymentIntentId);
-      } catch (error) {
-        // Already captured/canceled intents are fine to skip.
-        console.warn("⚠️ Could not cancel stale intent:", error.message);
-      }
-    }
-
-    await doc.ref.update({
-      status: "expired",
-      paymentStatus: "canceled",
-      expiredAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-  }
 }
 
 /**
@@ -441,180 +276,12 @@ async function assertGuideIsFree(guideId, guide, start, hours) {
   }
 }
 
-async function findBookingByPaymentIntent(paymentIntentId) {
-  const snapshot = await db
-    .collection("bookings")
-    .where("paymentIntentId", "==", paymentIntentId)
-    .limit(1)
-    .get();
-
-  return snapshot.empty ? null : snapshot.docs[0];
-}
-
-async function handleStripeEvent(event) {
-  const intent = event.data.object;
-
-  // A guide can only be booked once Stripe says their account can actually
-  // receive money — this is the single source of truth for payoutsEnabled.
-  if (event.type === "account.updated") {
-    const guideId = intent.metadata && intent.metadata.guideId;
-
-    if (guideId) {
-      const enabled =
-        intent.charges_enabled === true && intent.payouts_enabled === true;
-
-      await db.collection("guides").doc(guideId).update({
-        payoutsEnabled: enabled,
-      });
-
-      console.log(`✅ payoutsEnabled=${enabled} for guide`, guideId);
-    }
-
-    return;
-  }
-
-  switch (event.type) {
-    // Manual capture: the card was authorized and the money is now held.
-    case "payment_intent.amount_capturable_updated": {
-      const doc = await findBookingByPaymentIntent(intent.id);
-      if (!doc) break;
-
-      await doc.ref.update({
-        status: "confirmed",
-        paymentStatus: "authorized",
-        authorizedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      const booking = doc.data();
-
-      const token = await getUserToken("guide", booking.guideId);
-
-      await sendPushNotification({
-        token,
-        title: "New booking request",
-        body: `${displayName(booking.touristName, "A traveller")} booked your guide service`,
-        data: { type: "booking", bookingId: doc.id },
-      });
-
-      console.log("✅ Booking confirmed by webhook:", doc.id);
-      break;
-    }
-
-    // Funds captured.
-    case "payment_intent.succeeded": {
-      const doc = await findBookingByPaymentIntent(intent.id);
-      if (!doc) break;
-
-      await doc.ref.update({
-        status: "completed",
-        paymentStatus: "captured",
-        completedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      console.log("✅ Booking captured by webhook:", doc.id);
-      break;
-    }
-
-    case "payment_intent.canceled": {
-      const doc = await findBookingByPaymentIntent(intent.id);
-      if (!doc) break;
-
-      const current = doc.data().status;
-
-      await doc.ref.update({
-        status: current === "pending_payment" ? "expired" : "cancelled",
-        paymentStatus: "canceled",
-        cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      console.log("✅ Booking canceled by webhook:", doc.id);
-      break;
-    }
-
-    case "payment_intent.payment_failed": {
-      const doc = await findBookingByPaymentIntent(intent.id);
-      if (!doc) break;
-
-      await doc.ref.update({ paymentStatus: "failed" });
-      break;
-    }
-
-    default:
-      console.log("ℹ️ Unhandled event type:", event.type);
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Health
 // ---------------------------------------------------------------------------
 
 app.get("/", (req, res) => {
-  res.send("BookLocal Stripe backend is running");
-});
-
-// ---------------------------------------------------------------------------
-// Stripe Connect return pages
-// ---------------------------------------------------------------------------
-
-/**
- * Stripe requires `return_url` / `refresh_url` on an Account Link to be public
- * https URLs — a custom scheme like `booklocalguide://` is rejected outright.
- * These two pages are that https hop: they bounce the guide's browser straight
- * back into the app, with a tappable fallback if the automatic redirect is
- * blocked.
- */
-function appRedirectPage(target, heading, message) {
-  return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>BookLocal Guide</title>
-<style>
-  body { font-family: -apple-system, system-ui, sans-serif; margin: 0;
-         min-height: 100vh; display: flex; align-items: center;
-         justify-content: center; background: #f6f7f9; color: #111; }
-  .card { text-align: center; padding: 32px 24px; max-width: 340px; }
-  h1 { font-size: 22px; margin: 0 0 8px; }
-  p { color: #666; font-size: 15px; line-height: 1.45; margin: 0 0 24px; }
-  a { display: inline-block; background: #0a84ff; color: #fff;
-      text-decoration: none; font-weight: 600; padding: 14px 28px;
-      border-radius: 14px; }
-  @media (prefers-color-scheme: dark) {
-    body { background: #000; color: #fff; }
-    p { color: #98989d; }
-  }
-</style>
-</head>
-<body>
-  <div class="card">
-    <h1>${heading}</h1>
-    <p>${message}</p>
-    <a href="${target}">Open BookLocal Guide</a>
-  </div>
-  <script>window.location.replace(${JSON.stringify(target)});</script>
-</body>
-</html>`;
-}
-
-app.get("/stripe-return", (req, res) => {
-  res.set("Content-Type", "text/html; charset=utf-8").send(
-    appRedirectPage(
-      "booklocalguide://stripe-return",
-      "All set",
-      "Returning you to the app. Your payout details are being verified — this usually takes a moment."
-    )
-  );
-});
-
-app.get("/stripe-refresh", (req, res) => {
-  res.set("Content-Type", "text/html; charset=utf-8").send(
-    appRedirectPage(
-      "booklocalguide://stripe-refresh",
-      "Link expired",
-      "That setup link is no longer valid. Open the app and tap Connect payouts again."
-    )
-  );
+  res.send("BookLocal Guide backend is running");
 });
 
 // ---------------------------------------------------------------------------
@@ -686,65 +353,6 @@ app.post("/send-support-notification", requireAuth, requireAdmin, async (req, re
 });
 
 // ---------------------------------------------------------------------------
-// Stripe Connect onboarding (guides)
-// ---------------------------------------------------------------------------
-
-app.post("/create-connect-account", requireAuth, async (req, res) => {
-  try {
-    // A guide may only create a Connect account for themselves.
-    const guideDoc = await db.collection("guides").doc(req.uid).get();
-
-    if (!guideDoc.exists) {
-      return res.status(403).json({ error: "Only guides can connect payouts" });
-    }
-
-    const secure = await getPrivateData("guides", req.uid);
-
-    if (secure.stripeAccountId) {
-      const link = await stripe.accountLinks.create({
-        account: secure.stripeAccountId,
-        refresh_url: `${publicBaseUrl}/stripe-refresh`,
-        return_url: `${publicBaseUrl}/stripe-return`,
-        type: "account_onboarding",
-      });
-
-      return res.json({ onboardingUrl: link.url });
-    }
-
-    const account = await stripe.accounts.create({
-      type: "express",
-      email: secure.email || undefined,
-      capabilities: {
-        card_payments: { requested: true },
-        transfers: { requested: true },
-      },
-      metadata: { guideId: req.uid },
-    });
-
-    const accountLink = await stripe.accountLinks.create({
-      account: account.id,
-      refresh_url: `${publicBaseUrl}/stripe-refresh`,
-      return_url: `${publicBaseUrl}/stripe-return`,
-      type: "account_onboarding",
-    });
-
-    // Neither field is client-writable (see firestore.rules): the account id is
-    // private, and payoutsEnabled only flips on the account.updated webhook.
-    await privateRef("guides", req.uid).set(
-      { stripeAccountId: account.id },
-      { merge: true }
-    );
-
-    await guideDoc.ref.update({ payoutsEnabled: false });
-
-    res.json({ onboardingUrl: accountLink.url });
-  } catch (error) {
-    console.error("❌ create-connect-account error:", error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ---------------------------------------------------------------------------
 // Booking + payment
 // ---------------------------------------------------------------------------
 
@@ -753,7 +361,7 @@ app.post("/create-connect-account", requireAuth, async (req, res) => {
  * The client never sends an amount and never creates booking documents, so the
  * price and the duplicate check cannot be bypassed.
  */
-app.post("/create-booking-intent", requireAuth, async (req, res) => {
+app.post("/create-booking", requireAuth, async (req, res) => {
   try {
     const { guideId, serviceId, date, hours, peopleCount, notes } = req.body;
 
@@ -794,13 +402,6 @@ app.post("/create-booking-intent", requireAuth, async (req, res) => {
     }
 
     const guide = guideDoc.data();
-    const guideSecure = await getPrivateData("guides", guideId);
-
-    if (!guideSecure.stripeAccountId || guide.payoutsEnabled !== true) {
-      return res
-        .status(400)
-        .json({ error: "Guide has not connected a payout account yet." });
-    }
 
     // Blocking works both ways: neither side can book the other after a block.
     const blocked = await db
@@ -813,7 +414,6 @@ app.post("/create-booking-intent", requireAuth, async (req, res) => {
       return res.status(403).json({ error: "This booking is not available." });
     }
 
-    // Duplicate check happens BEFORE any money moves.
     const duplicate = await db
       .collection("bookings")
       .where("touristId", "==", req.uid)
@@ -828,54 +428,30 @@ app.post("/create-booking-intent", requireAuth, async (req, res) => {
         .json({ error: "You already have an active booking with this guide." });
     }
 
-    await clearStalePendingBookings(req.uid, guideId);
-
-    // Working hours, blocked dates and slot collisions — checked before any
-    // Stripe object exists, so a clash never leaves an authorization behind.
+    // Working hours, blocked dates and slot collisions.
     try {
       await assertGuideIsFree(guideId, guide, parsedDate, parsedHours);
     } catch (conflict) {
       return res.status(409).json({ error: conflict.message });
     }
 
+    // The price is still read from the guide's own profile so the traveller
+    // sees a real figure — but no money moves through the platform. They pay
+    // the guide directly on the day.
     const amountUsd = calculateAmountUsd(guide, {
       serviceId,
       hours: parsedHours,
     });
 
-    if (!Number.isFinite(amountUsd) || amountUsd < 1) {
-      return res.status(400).json({ error: "Guide pricing is not configured" });
-    }
-
-    const amountInCents = Math.round(amountUsd * 100);
-    const platformFee = Math.round(amountInCents * PLATFORM_FEE_RATE);
-
     const tourist = touristDoc.data();
-
     const bookingRef = db.collection("bookings").doc();
-
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: amountInCents,
-      currency: "usd",
-      capture_method: "manual",
-      automatic_payment_methods: { enabled: true },
-      application_fee_amount: platformFee,
-      transfer_data: { destination: guideSecure.stripeAccountId },
-      metadata: {
-        bookingId: bookingRef.id,
-        touristId: req.uid,
-        guideId,
-        platformFee: String(platformFee),
-        guideShare: String(amountInCents - platformFee),
-      },
-    });
 
     await bookingRef.set({
       touristId: req.uid,
       touristName: displayName(tourist.fullName),
       profileImageUrl: tourist.profileImageUrl || "",
       guideId,
-      guideName: guide.name || "Guide",
+      guideName: displayName(guide.name, "Guide"),
       guideImageUrl: guide.profileImageUrl || "",
       city: guide.city || "",
       country: guide.country || "",
@@ -886,21 +462,128 @@ app.post("/create-booking-intent", requireAuth, async (req, res) => {
       pricePerHour: Math.round(amountUsd / parsedHours),
       totalPrice: amountUsd,
       message: typeof notes === "string" ? notes.trim().slice(0, 1000) : "",
-      status: "pending_payment",
-      paymentStatus: "requires_payment",
-      paymentIntentId: paymentIntent.id,
+      status: "pending",
       isReviewed: false,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    res.json({
-      bookingId: bookingRef.id,
-      clientSecret: paymentIntent.client_secret,
-      paymentIntentId: paymentIntent.id,
-      amount: amountUsd,
+    const token = await getUserToken("guide", guideId);
+
+    await sendPushNotification({
+      token,
+      title: "New booking request",
+      body: `${displayName(tourist.fullName, "A traveller")} wants to book you`,
+      data: { type: "booking", bookingId: bookingRef.id },
     });
+
+    res.json({ bookingId: bookingRef.id, amount: amountUsd });
   } catch (error) {
-    console.error("❌ create-booking-intent error:", error.message);
+    console.error("❌ create-booking error:", error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * The guide accepts or declines a request. Only they can, and only while it is
+ * still pending.
+ */
+app.post("/respond-booking", requireAuth, async (req, res) => {
+  try {
+    const { bookingId, accept } = req.body;
+
+    if (!bookingId || typeof accept !== "boolean") {
+      return res.status(400).json({ error: "Missing bookingId or accept" });
+    }
+
+    const doc = await db.collection("bookings").doc(bookingId).get();
+
+    if (!doc.exists) {
+      return res.status(404).json({ error: "Booking not found" });
+    }
+
+    const booking = doc.data();
+
+    if (booking.guideId !== req.uid) {
+      return res.status(403).json({ error: "Not your booking" });
+    }
+
+    if (booking.status !== "pending") {
+      return res.status(409).json({ error: "This request was already answered" });
+    }
+
+    await doc.ref.update({
+      status: accept ? "confirmed" : "declined",
+      respondedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    const token = await getUserToken("tourist", booking.touristId);
+
+    await sendPushNotification({
+      token,
+      title: accept ? "Booking confirmed" : "Booking declined",
+      body: accept
+        ? `${displayName(booking.guideName, "Your guide")} accepted your request`
+        : `${displayName(booking.guideName, "The guide")} can't make that time`,
+      data: { type: "booking", bookingId },
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("❌ respond-booking error:", error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Either side can call off a booking that has not happened yet.
+ */
+app.post("/cancel-booking", requireAuth, async (req, res) => {
+  try {
+    const { bookingId } = req.body;
+
+    if (!bookingId) {
+      return res.status(400).json({ error: "Missing bookingId" });
+    }
+
+    const doc = await db.collection("bookings").doc(bookingId).get();
+
+    if (!doc.exists) {
+      return res.status(404).json({ error: "Booking not found" });
+    }
+
+    const booking = doc.data();
+    const isTourist = booking.touristId === req.uid;
+    const isGuide = booking.guideId === req.uid;
+
+    if (!isTourist && !isGuide) {
+      return res.status(403).json({ error: "Not your booking" });
+    }
+
+    if (!ACTIVE_BOOKING_STATUSES.includes(booking.status)) {
+      return res.status(409).json({ error: "This booking cannot be cancelled" });
+    }
+
+    await doc.ref.update({
+      status: "cancelled",
+      cancelledBy: isTourist ? "tourist" : "guide",
+      cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    const token = await getUserToken(
+      isTourist ? "guide" : "tourist",
+      isTourist ? booking.guideId : booking.touristId
+    );
+
+    await sendPushNotification({
+      token,
+      title: "Booking cancelled",
+      body: "A booking on your calendar was cancelled.",
+      data: { type: "booking", bookingId },
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("❌ cancel-booking error:", error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -979,8 +662,8 @@ app.post("/guide-availability", requireAuth, async (req, res) => {
 });
 
 /**
- * The guide marks the trip finished; the tourist then has AUTO_RELEASE_HOURS to
- * confirm or dispute.
+ * The guide marks the trip done. With no money held there is nothing to
+ * release — this just closes the booking and unlocks the review.
  */
 app.post("/mark-trip-finished", requireAuth, async (req, res) => {
   try {
@@ -1007,16 +690,16 @@ app.post("/mark-trip-finished", requireAuth, async (req, res) => {
     }
 
     await doc.ref.update({
-      status: "waiting_tourist_confirmation",
-      finishedAt: admin.firestore.FieldValue.serverTimestamp(),
+      status: "completed",
+      completedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
     const token = await getUserToken("tourist", booking.touristId);
 
     await sendPushNotification({
       token,
-      title: "Confirm your trip",
-      body: `${booking.guideName || "Your guide"} marked the trip as finished.`,
+      title: "How was your trip?",
+      body: `${displayName(booking.guideName, "Your guide")} marked the trip complete. Leave a review.`,
       data: { type: "booking", bookingId },
     });
 
@@ -1027,159 +710,6 @@ app.post("/mark-trip-finished", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/capture-payment", requireAuth, async (req, res) => {
-  try {
-    const { bookingId } = req.body;
-
-    if (!bookingId) {
-      return res.status(400).json({ error: "Missing bookingId" });
-    }
-
-    const doc = await db.collection("bookings").doc(bookingId).get();
-
-    if (!doc.exists) {
-      return res.status(404).json({ error: "Booking not found" });
-    }
-
-    const booking = doc.data();
-
-    // Only the tourist who paid may release the money.
-    if (booking.touristId !== req.uid) {
-      return res.status(403).json({ error: "Not your booking" });
-    }
-
-    if (booking.status === "dispute") {
-      return res
-        .status(409)
-        .json({ error: "This booking is under dispute review" });
-    }
-
-    if (booking.paymentStatus === "captured") {
-      return res.json({ success: true, status: "already_captured" });
-    }
-
-    if (!booking.paymentIntentId) {
-      return res.status(409).json({ error: "Booking has no payment" });
-    }
-
-    const captured = await stripe.paymentIntents.capture(booking.paymentIntentId);
-
-    // The webhook also writes this; doing it here keeps the UI instant.
-    await doc.ref.update({
-      status: "completed",
-      paymentStatus: "captured",
-      completedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    res.json({ success: true, status: captured.status });
-  } catch (error) {
-    console.error("❌ capture-payment error:", error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post("/cancel-payment", requireAuth, async (req, res) => {
-  try {
-    const { bookingId } = req.body;
-
-    if (!bookingId) {
-      return res.status(400).json({ error: "Missing bookingId" });
-    }
-
-    const doc = await db.collection("bookings").doc(bookingId).get();
-
-    if (!doc.exists) {
-      return res.status(404).json({ error: "Booking not found" });
-    }
-
-    const booking = doc.data();
-
-    const isTourist = booking.touristId === req.uid;
-    const isGuide = booking.guideId === req.uid;
-
-    if (!isTourist && !isGuide) {
-      return res.status(403).json({ error: "Not your booking" });
-    }
-
-    if (!["pending_payment", "confirmed"].includes(booking.status)) {
-      return res.status(409).json({ error: "This booking cannot be cancelled" });
-    }
-
-    // The 24 hour cancellation window is enforced here, not in the app.
-    if (isTourist && booking.date) {
-      const hoursLeft =
-        (booking.date.toDate().getTime() - Date.now()) / (1000 * 60 * 60);
-
-      if (hoursLeft < 24) {
-        return res.status(409).json({
-          error:
-            "Bookings can only be cancelled at least 24 hours before the trip.",
-        });
-      }
-    }
-
-    if (booking.paymentIntentId) {
-      await stripe.paymentIntents.cancel(booking.paymentIntentId);
-    }
-
-    await doc.ref.update({
-      status: "cancelled",
-      paymentStatus: "canceled",
-      cancelledBy: isTourist ? "tourist" : "guide",
-      cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error("❌ cancel-payment error:", error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post("/report-problem", requireAuth, async (req, res) => {
-  try {
-    const { bookingId, reason } = req.body;
-
-    if (!bookingId || !reason) {
-      return res.status(400).json({ error: "Missing bookingId or reason" });
-    }
-
-    const doc = await db.collection("bookings").doc(bookingId).get();
-
-    if (!doc.exists) {
-      return res.status(404).json({ error: "Booking not found" });
-    }
-
-    const booking = doc.data();
-
-    if (booking.touristId !== req.uid) {
-      return res.status(403).json({ error: "Not your booking" });
-    }
-
-    if (booking.paymentStatus === "captured") {
-      return res
-        .status(409)
-        .json({ error: "This booking has already been paid out" });
-    }
-
-    await doc.ref.update({
-      status: "dispute",
-      disputeReason: String(reason).trim().slice(0, 2000),
-      disputedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error("❌ report-problem error:", error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-/**
- * Reviews are written here so the rating average stays consistent (a client
- * read-modify-write race could corrupt it) and so only a tourist who actually
- * completed the booking can leave one.
- */
 app.post("/submit-review", requireAuth, async (req, res) => {
   try {
     const { bookingId, rating, comment } = req.body;
@@ -1304,77 +834,6 @@ app.post("/record-violation", requireAuth, async (req, res) => {
 // Admin
 // ---------------------------------------------------------------------------
 
-app.post("/resolve-dispute", requireAuth, requireAdmin, async (req, res) => {
-  try {
-    const { bookingId, action } = req.body;
-
-    if (!bookingId || !["release", "refund"].includes(action)) {
-      return res.status(400).json({ error: "Missing bookingId or invalid action" });
-    }
-
-    const doc = await db.collection("bookings").doc(bookingId).get();
-
-    if (!doc.exists) {
-      return res.status(404).json({ error: "Booking not found" });
-    }
-
-    const booking = doc.data();
-
-    if (!booking.paymentIntentId) {
-      return res.status(409).json({ error: "Booking has no payment" });
-    }
-
-    const intent = await stripe.paymentIntents.retrieve(booking.paymentIntentId);
-
-    if (action === "release") {
-      if (intent.status === "requires_capture") {
-        await stripe.paymentIntents.capture(booking.paymentIntentId);
-      }
-
-      await doc.ref.update({
-        status: "completed",
-        paymentStatus: "captured",
-        resolvedBy: req.uid,
-        resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      return res.json({ success: true, status: "released" });
-    }
-
-    // Refund: an authorized-but-uncaptured intent is cancelled, a captured one
-    // has to go through the refund API — cancel() fails on captured intents.
-    if (intent.status === "requires_capture") {
-      await stripe.paymentIntents.cancel(booking.paymentIntentId);
-    } else if (intent.status === "succeeded") {
-      await stripe.refunds.create({
-        payment_intent: booking.paymentIntentId,
-        refund_application_fee: true,
-        reverse_transfer: true,
-      });
-    } else {
-      return res
-        .status(409)
-        .json({ error: `Cannot refund an intent in state ${intent.status}` });
-    }
-
-    await doc.ref.update({
-      status: "refunded",
-      paymentStatus: "refunded",
-      resolvedBy: req.uid,
-      resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    res.json({ success: true, status: "refunded" });
-  } catch (error) {
-    console.error("❌ resolve-dispute error:", error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-/**
- * Deletes every trace of a user. Called by the in-app "Delete Account" flow,
- * which App Store guideline 5.1.1(v) requires.
- */
 app.post("/delete-account", requireAuth, async (req, res) => {
   try {
     const uid = req.uid;
@@ -1425,86 +884,6 @@ app.post("/delete-account", requireAuth, async (req, res) => {
   } catch (error) {
     console.error("❌ delete-account error:", error.message);
     res.status(500).json({ error: error.message });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// Scheduled jobs
-// ---------------------------------------------------------------------------
-
-// Release money that the tourist neither confirmed nor disputed in time. The
-// clock starts when the guide marked the trip finished, not when the booking
-// was created.
-cron.schedule("*/10 * * * *", async () => {
-  try {
-    const cutoff = admin.firestore.Timestamp.fromMillis(
-      Date.now() - AUTO_RELEASE_HOURS * 60 * 60 * 1000
-    );
-
-    const snapshot = await db
-      .collection("bookings")
-      .where("status", "==", "waiting_tourist_confirmation")
-      .where("paymentStatus", "==", "authorized")
-      .where("finishedAt", "<=", cutoff)
-      .get();
-
-    for (const doc of snapshot.docs) {
-      const data = doc.data();
-
-      if (!data.paymentIntentId) continue;
-
-      try {
-        await stripe.paymentIntents.capture(data.paymentIntentId);
-
-        await doc.ref.update({
-          status: "completed",
-          paymentStatus: "captured",
-          autoReleased: true,
-          completedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        console.log("💰 Auto captured:", doc.id);
-      } catch (err) {
-        console.error("❌ Auto capture error:", doc.id, err.message);
-      }
-    }
-  } catch (err) {
-    console.error("❌ Auto-release cron error:", err.message);
-  }
-});
-
-// Drop payment intents the tourist abandoned at the payment sheet.
-cron.schedule("*/15 * * * *", async () => {
-  try {
-    const cutoff = admin.firestore.Timestamp.fromMillis(
-      Date.now() - PENDING_PAYMENT_TTL_MINUTES * 60 * 1000
-    );
-
-    const snapshot = await db
-      .collection("bookings")
-      .where("status", "==", "pending_payment")
-      .where("createdAt", "<=", cutoff)
-      .get();
-
-    for (const doc of snapshot.docs) {
-      const data = doc.data();
-
-      if (data.paymentIntentId) {
-        try {
-          await stripe.paymentIntents.cancel(data.paymentIntentId);
-        } catch (err) {
-          console.warn("⚠️ Stale intent cancel skipped:", err.message);
-        }
-      }
-
-      await doc.ref.update({
-        status: "expired",
-        paymentStatus: "canceled",
-        expiredAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-    }
-  } catch (err) {
-    console.error("❌ Pending cleanup cron error:", err.message);
   }
 });
 

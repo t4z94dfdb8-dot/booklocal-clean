@@ -17,8 +17,6 @@
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
     "express": "^5.1.0",
-    "firebase-admin": "^13.8.0",
-    "node-cron": "^4.2.1",
-    "stripe": "^22.1.0"
+    "firebase-admin": "^13.8.0"
   }
 }
