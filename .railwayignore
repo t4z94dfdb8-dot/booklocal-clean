@@ -1,0 +1,11 @@
+# `railway up` uploads this directory. Secrets belong in Railway's own
+# Variables tab, never in the build context — and a committed .env would
+# silently override them at runtime via dotenv.
+.env
+.env.*
+*serviceAccount*.json
+*firebase-adminsdk*.json
+
+node_modules/
+.git/
+.DS_Store

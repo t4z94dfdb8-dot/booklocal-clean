@@ -22,12 +22,55 @@ if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
   process.exit(1);
 }
 
-const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+/**
+ * Payments here are destination charges: the PaymentIntent is created on the
+ * platform account with `transfer_data.destination`, so `payment_intent.*`
+ * events arrive on the **platform** ("Your account") — while `account.updated`,
+ * which drives `payoutsEnabled`, arrives on **Connected accounts**.
+ *
+ * Stripe scopes an endpoint to one or the other, so that is two endpoints
+ * pointing at this same URL, each with its own signing secret. Hence a list:
+ *
+ *   STRIPE_WEBHOOK_SECRET=whsec_platform...,whsec_connect...
+ */
+const webhookSecrets = (process.env.STRIPE_WEBHOOK_SECRET || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
-if (!webhookSecret) {
+if (!webhookSecrets.length) {
   console.warn(
     "⚠️  STRIPE_WEBHOOK_SECRET is missing — /stripe-webhook will reject every request"
   );
+} else {
+  // Count only, never the values. Two are expected: one for the platform
+  // ("Your account") endpoint and one for the Connect endpoint.
+  console.log(`🔑 ${webhookSecrets.length} webhook signing secret(s) loaded`);
+
+  if (webhookSecrets.length === 1) {
+    console.warn(
+      "⚠️  Only one secret configured. account.updated arrives on a separate " +
+        "Connect endpoint, so payoutsEnabled will never be set without its secret too."
+    );
+  }
+}
+
+/**
+ * Verifies against each configured secret and returns the event, so one URL can
+ * serve both endpoints. Stripe's own comparison is timing-safe.
+ */
+function constructWebhookEvent(rawBody, signature) {
+  let lastError;
+
+  for (const secret of webhookSecrets) {
+    try {
+      return stripe.webhooks.constructEvent(rawBody, signature, secret);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error("No webhook signing secret configured");
 }
 
 const stripe = Stripe(stripeKey);
@@ -57,6 +100,25 @@ const MAX_PEOPLE = 20;
 
 // How long a user is muted after three contact-sharing warnings.
 const MUTE_MINUTES = 30;
+
+/**
+ * Public origin of this server, used for the Stripe Connect return pages.
+ * Railway injects RAILWAY_PUBLIC_DOMAIN; PUBLIC_BASE_URL overrides it if the
+ * service ever moves behind a custom domain.
+ */
+const publicBaseUrl = (
+  process.env.PUBLIC_BASE_URL ||
+  (process.env.RAILWAY_PUBLIC_DOMAIN
+    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+    : "")
+).replace(/\/$/, "");
+
+if (!publicBaseUrl) {
+  console.warn(
+    "⚠️  Neither PUBLIC_BASE_URL nor RAILWAY_PUBLIC_DOMAIN is set — Stripe " +
+      "Connect onboarding will have nowhere to return to."
+  );
+}
 
 const NAME_PLACEHOLDER = "Traveller";
 
@@ -119,17 +181,16 @@ app.post(
   "/stripe-webhook",
   express.raw({ type: "application/json" }),
   async (req, res) => {
-    if (!webhookSecret) {
+    if (!webhookSecrets.length) {
       return res.status(500).send("Webhook secret not configured");
     }
 
     let event;
 
     try {
-      event = stripe.webhooks.constructEvent(
+      event = constructWebhookEvent(
         req.body,
-        req.headers["stripe-signature"],
-        webhookSecret
+        req.headers["stripe-signature"]
       );
     } catch (error) {
       console.error("❌ Webhook signature verification failed:", error.message);
@@ -492,6 +553,71 @@ app.get("/", (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Stripe Connect return pages
+// ---------------------------------------------------------------------------
+
+/**
+ * Stripe requires `return_url` / `refresh_url` on an Account Link to be public
+ * https URLs — a custom scheme like `booklocalguide://` is rejected outright.
+ * These two pages are that https hop: they bounce the guide's browser straight
+ * back into the app, with a tappable fallback if the automatic redirect is
+ * blocked.
+ */
+function appRedirectPage(target, heading, message) {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BookLocal Guide</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 0;
+         min-height: 100vh; display: flex; align-items: center;
+         justify-content: center; background: #f6f7f9; color: #111; }
+  .card { text-align: center; padding: 32px 24px; max-width: 340px; }
+  h1 { font-size: 22px; margin: 0 0 8px; }
+  p { color: #666; font-size: 15px; line-height: 1.45; margin: 0 0 24px; }
+  a { display: inline-block; background: #0a84ff; color: #fff;
+      text-decoration: none; font-weight: 600; padding: 14px 28px;
+      border-radius: 14px; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #000; color: #fff; }
+    p { color: #98989d; }
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>${heading}</h1>
+    <p>${message}</p>
+    <a href="${target}">Open BookLocal Guide</a>
+  </div>
+  <script>window.location.replace(${JSON.stringify(target)});</script>
+</body>
+</html>`;
+}
+
+app.get("/stripe-return", (req, res) => {
+  res.set("Content-Type", "text/html; charset=utf-8").send(
+    appRedirectPage(
+      "booklocalguide://stripe-return",
+      "All set",
+      "Returning you to the app. Your payout details are being verified — this usually takes a moment."
+    )
+  );
+});
+
+app.get("/stripe-refresh", (req, res) => {
+  res.set("Content-Type", "text/html; charset=utf-8").send(
+    appRedirectPage(
+      "booklocalguide://stripe-refresh",
+      "Link expired",
+      "That setup link is no longer valid. Open the app and tap Connect payouts again."
+    )
+  );
+});
+
+// ---------------------------------------------------------------------------
 // Push notifications
 // ---------------------------------------------------------------------------
 
@@ -577,8 +703,8 @@ app.post("/create-connect-account", requireAuth, async (req, res) => {
     if (secure.stripeAccountId) {
       const link = await stripe.accountLinks.create({
         account: secure.stripeAccountId,
-        refresh_url: "https://booklocalguide.com/stripe-refresh",
-        return_url: "https://booklocalguide.com/stripe-return",
+        refresh_url: `${publicBaseUrl}/stripe-refresh`,
+        return_url: `${publicBaseUrl}/stripe-return`,
         type: "account_onboarding",
       });
 
@@ -597,8 +723,8 @@ app.post("/create-connect-account", requireAuth, async (req, res) => {
 
     const accountLink = await stripe.accountLinks.create({
       account: account.id,
-      refresh_url: "https://booklocalguide.com/stripe-refresh",
-      return_url: "https://booklocalguide.com/stripe-return",
+      refresh_url: `${publicBaseUrl}/stripe-refresh`,
+      return_url: `${publicBaseUrl}/stripe-return`,
       type: "account_onboarding",
     });
 

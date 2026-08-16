@@ -108,11 +108,24 @@ no root-directory override: Nixpacks detects Node, installs, and runs
 `https://booklocal-production-xxxx.up.railway.app`. Three places must then point
 at it:
 
-1. **Stripe webhook** — Dashboard -> Developers -> Webhooks -> Add endpoint,
-   URL `<railway-url>/stripe-webhook`, events:
-   `payment_intent.amount_capturable_updated`, `payment_intent.succeeded`,
-   `payment_intent.canceled`, `payment_intent.payment_failed`,
-   `account.updated`. Copy the signing secret into `STRIPE_WEBHOOK_SECRET`.
+1. **Stripe webhooks** — **two** endpoints, both pointing at
+   `<railway-url>/stripe-webhook`.
+
+   Payments are destination charges (`transfer_data.destination` on a
+   PaymentIntent created on the platform), so the payment events land on the
+   platform while `account.updated` lands on the connected account:
+
+   | Endpoint scope | Events |
+   | --- | --- |
+   | Your account | `payment_intent.amount_capturable_updated`, `payment_intent.succeeded`, `payment_intent.canceled`, `payment_intent.payment_failed` |
+   | Connected accounts | `account.updated` |
+
+   Each endpoint has its own signing secret. Put both in
+   `STRIPE_WEBHOOK_SECRET`, comma separated:
+
+   ```
+   STRIPE_WEBHOOK_SECRET=whsec_platform...,whsec_connect...
+   ```
 2. **iOS app** — `BACKEND_BASE_URL` in the Xcode target's build settings
    (Debug and Release both).
 3. **Stripe Connect return URLs** — the `refresh_url` / `return_url` in
